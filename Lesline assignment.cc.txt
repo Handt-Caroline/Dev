@@ -1,0 +1,272 @@
+/* 
+ * Community Cloud Information Management System (CCIMS)
+ * WAN Network Simulation using NS-3.29
+ * 
+ * Models:
+ * - Multiple schools + council offices connected to a WAN router
+ * - Cloud server hosting CCIMS platform
+ * - Schools/councils upload data to the cloud server using TCP
+ * - Measures throughput, delay, jitter, packet loss via FlowMonitor
+ * - Generates NetAnim visualization file
+ * 
+ * Author: MADONGUE JEANNE LESLINE
+ * Course: Wide Area Network
+ */
+
+#include <iostream>
+#include <map>
+#include <string>
+
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/point-to-point-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/flow-monitor-module.h"
+#include "ns3/netanim-module.h"
+
+using namespace ns3;
+
+NS_LOG_COMPONENT_DEFINE("CCIMS_WAN_Simulation");
+
+int main(int argc, char *argv[])
+{
+    // ------------------- Parameters -------------------
+    uint32_t numSchools  = 3;
+    uint32_t numCouncils = 2;
+    double simTime       = 100.0;     // seconds
+    uint32_t packetSize  = 1024;      // bytes
+    std::string animFile = "ccims_wan_simulation.xml";
+
+    CommandLine cmd;
+    cmd.AddValue("numSchools",  "Number of schools", numSchools);
+    cmd.AddValue("numCouncils", "Number of councils", numCouncils);
+    cmd.AddValue("simTime",     "Simulation time (seconds)", simTime);
+    cmd.AddValue("packetSize",  "Packet size (bytes)", packetSize);
+    cmd.AddValue("animFile",    "NetAnim output file", animFile);
+    cmd.Parse(argc, argv);
+
+    LogComponentEnable("CCIMS_WAN_Simulation", LOG_LEVEL_INFO);
+
+    NS_LOG_INFO("=== CCIMS WAN Simulation (NS-3.29) ===");
+    NS_LOG_INFO("Schools: " << numSchools << " | Councils: " << numCouncils 
+                 << " | Time: " << simTime << "s");
+
+    // ------------------- Step 1: Create Nodes -------------------
+    Ptr<Node> cloud = CreateObject<Node>();
+    Ptr<Node> router = CreateObject<Node>();
+
+    NodeContainer schools;
+    schools.Create(numSchools);
+
+    NodeContainer councils;
+    councils.Create(numCouncils);
+
+    // ------------------- Step 2: Create Links -------------------
+    PointToPointHelper p2pBackbone;
+    p2pBackbone.SetDeviceAttribute("DataRate", StringValue("100Mbps"));
+    p2pBackbone.SetChannelAttribute("Delay", StringValue("10ms"));
+
+    PointToPointHelper p2pAccess;
+    p2pAccess.SetDeviceAttribute("DataRate", StringValue("10Mbps"));
+    p2pAccess.SetChannelAttribute("Delay", StringValue("5ms"));
+
+    // Cloud <-> Router (backbone)
+    NetDeviceContainer dCloudRouter = p2pBackbone.Install(cloud, router);
+
+    // School <-> Router links (store each link)
+    std::vector<NetDeviceContainer> dSchoolRouter(numSchools);
+    for (uint32_t i = 0; i < numSchools; ++i)
+    {
+        dSchoolRouter[i] = p2pAccess.Install(schools.Get(i), router);
+    }
+
+    // Council <-> Router links (store each link)
+    std::vector<NetDeviceContainer> dCouncilRouter(numCouncils);
+    for (uint32_t i = 0; i < numCouncils; ++i)
+    {
+        dCouncilRouter[i] = p2pAccess.Install(councils.Get(i), router);
+    }
+
+    // ------------------- Step 3: Install Internet Stack -------------------
+    InternetStackHelper stack;
+    stack.Install(cloud);
+    stack.Install(router);
+    stack.Install(schools);
+    stack.Install(councils);
+
+    // ------------------- Step 4: Assign IP Addresses -------------------
+    Ipv4AddressHelper address;
+
+    // Cloud-Router: 10.1.1.0/30
+    address.SetBase("10.1.1.0", "255.255.255.252");
+    Ipv4InterfaceContainer ifCloudRouter = address.Assign(dCloudRouter);
+
+    // For each school link: new /30 subnet (10.1.2.0/30, 10.1.2.4/30, ...)
+    std::vector<Ipv4InterfaceContainer> ifSchoolRouter(numSchools);
+    address.SetBase("10.1.2.0", "255.255.255.252");
+    for (uint32_t i = 0; i < numSchools; ++i)
+    {
+        ifSchoolRouter[i] = address.Assign(dSchoolRouter[i]);
+        address.NewNetwork();
+    }
+
+    // For each council link: new /30 subnet (10.1.10.0/30, 10.1.10.4/30, ...)
+    std::vector<Ipv4InterfaceContainer> ifCouncilRouter(numCouncils);
+    address.SetBase("10.1.10.0", "255.255.255.252");
+    for (uint32_t i = 0; i < numCouncils; ++i)
+    {
+        ifCouncilRouter[i] = address.Assign(dCouncilRouter[i]);
+        address.NewNetwork();
+    }
+
+    // Routing
+    Ipv4GlobalRoutingHelper::PopulateRoutingTables();
+
+    // ------------------- Step 5: Applications -------------------
+    uint16_t port = 5000;
+
+    // Cloud server receives TCP traffic
+    PacketSinkHelper sinkHelper("ns3::TcpSocketFactory",
+                                InetSocketAddress(Ipv4Address::GetAny(), port));
+    ApplicationContainer sinkApp = sinkHelper.Install(cloud);
+    sinkApp.Start(Seconds(0.0));
+    sinkApp.Stop(Seconds(simTime));
+
+    // Cloud server IP (cloud side of cloud-router link)
+    Address cloudAddress(InetSocketAddress(ifCloudRouter.GetAddress(0), port));
+
+    // Schools upload (TCP OnOff)
+    for (uint32_t i = 0; i < numSchools; ++i)
+    {
+        OnOffHelper onoff("ns3::TcpSocketFactory", cloudAddress);
+        onoff.SetAttribute("DataRate", StringValue("5Mbps"));
+        onoff.SetAttribute("PacketSize", UintegerValue(packetSize));
+        onoff.SetAttribute("OnTime",  StringValue("ns3::ConstantRandomVariable[Constant=1]"));
+        onoff.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
+
+        ApplicationContainer app = onoff.Install(schools.Get(i));
+        app.Start(Seconds(1.0 + i * 0.5));
+        app.Stop(Seconds(simTime - 1.0));
+    }
+
+    // Councils upload (TCP OnOff)
+    for (uint32_t i = 0; i < numCouncils; ++i)
+    {
+        OnOffHelper onoff("ns3::TcpSocketFactory", cloudAddress);
+        onoff.SetAttribute("DataRate", StringValue("3Mbps"));
+        onoff.SetAttribute("PacketSize", UintegerValue(packetSize));
+        onoff.SetAttribute("OnTime",  StringValue("ns3::ConstantRandomVariable[Constant=1]"));
+        onoff.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
+
+        ApplicationContainer app = onoff.Install(councils.Get(i));
+        app.Start(Seconds(2.0 + i * 0.5));
+        app.Stop(Seconds(simTime - 1.0));
+    }
+
+    // ------------------- Step 6: FlowMonitor -------------------
+    FlowMonitorHelper flowmon;
+    Ptr<FlowMonitor> monitor = flowmon.InstallAll();
+
+    // ------------------- Step 7: NetAnim -------------------
+    AnimationInterface anim(animFile);
+
+    anim.SetConstantPosition(cloud,  50.0, 10.0);
+    anim.SetConstantPosition(router, 50.0, 30.0);
+
+    for (uint32_t i = 0; i < numSchools; ++i)
+        anim.SetConstantPosition(schools.Get(i), 20.0 + i * 20.0, 50.0);
+
+    for (uint32_t i = 0; i < numCouncils; ++i)
+        anim.SetConstantPosition(councils.Get(i), 30.0 + i * 20.0, 70.0);
+
+    anim.UpdateNodeDescription(cloud, "Cloud Server (CCIMS)");
+    anim.UpdateNodeDescription(router, "WAN Router/Gateway");
+    anim.UpdateNodeColor(cloud, 0, 0, 255);
+    anim.UpdateNodeColor(router, 255, 165, 0);
+
+    for (uint32_t i = 0; i < numSchools; ++i)
+    {
+        anim.UpdateNodeDescription(schools.Get(i), "School_" + std::to_string(i + 1));
+        anim.UpdateNodeColor(schools.Get(i), 0, 255, 0);
+    }
+
+    for (uint32_t i = 0; i < numCouncils; ++i)
+    {
+        anim.UpdateNodeDescription(councils.Get(i), "Council_" + std::to_string(i + 1));
+        anim.UpdateNodeColor(councils.Get(i), 255, 0, 0);
+    }
+
+    // ------------------- Step 8: Run -------------------
+    NS_LOG_INFO("Starting simulation...");
+    Simulator::Stop(Seconds(simTime));
+    Simulator::Run();
+
+    // ------------------- Step 9: Print Statistics -------------------
+    NS_LOG_INFO("Simulation finished. Generating statistics...");
+
+    monitor->CheckForLostPackets();
+    Ptr<Ipv4FlowClassifier> classifier =
+        DynamicCast<Ipv4FlowClassifier>(flowmon.GetClassifier());
+    std::map<FlowId, FlowMonitor::FlowStats> stats = monitor->GetFlowStats();
+
+    std::cout << "\n========== CCIMS Network Performance Statistics ==========\n";
+
+    double totalThroughput = 0.0;
+    uint32_t totalTxPackets = 0;
+    uint32_t totalRxPackets = 0;
+
+    for (std::map<FlowId, FlowMonitor::FlowStats>::const_iterator it = stats.begin();
+         it != stats.end(); ++it)
+    {
+        Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(it->first);
+
+        uint32_t txP = it->second.txPackets;
+        uint32_t rxP = it->second.rxPackets;
+
+        double throughputMbps = (it->second.rxBytes * 8.0) / simTime / 1000000.0;
+
+        double avgDelayMs = 0.0;
+        if (rxP > 0)
+            avgDelayMs = (it->second.delaySum.GetSeconds() / rxP) * 1000.0;
+
+        double avgJitterMs = 0.0;
+        if (rxP > 1)
+            avgJitterMs = (it->second.jitterSum.GetSeconds() / (rxP - 1)) * 1000.0;
+
+        double lossPercent = 0.0;
+        if (txP > 0)
+            lossPercent = ((txP - rxP) * 100.0) / txP;
+
+        std::cout << "\nFlow " << it->first << " (" << t.sourceAddress
+                  << " -> " << t.destinationAddress << ")\n";
+        std::cout << "  Throughput: " << throughputMbps << " Mbps\n";
+        std::cout << "  Average Delay: " << avgDelayMs << " ms\n";
+        std::cout << "  Average Jitter: " << avgJitterMs << " ms\n";
+        std::cout << "  Packet Loss: " << lossPercent << " %\n";
+        std::cout << "  Packets Sent: " << txP << "\n";
+        std::cout << "  Packets Received: " << rxP << "\n";
+
+        totalThroughput += throughputMbps;
+        totalTxPackets += txP;
+        totalRxPackets += rxP;
+    }
+
+    std::cout << "\n========== Overall Network Summary ==========\n";
+    std::cout << "Total Throughput (sum of flows): " << totalThroughput << " Mbps\n";
+    std::cout << "Total Packets Sent: " << totalTxPackets << "\n";
+    std::cout << "Total Packets Received: " << totalRxPackets << "\n";
+
+    if (totalTxPackets > 0)
+    {
+        std::cout << "Overall Packet Delivery Ratio: "
+                  << (totalRxPackets * 100.0 / totalTxPackets) << " %\n";
+    }
+
+    std::cout << "\nAnimation file created: " << animFile << "\n";
+    std::cout << "Open it using NetAnim.\n";
+
+    Simulator::Destroy();
+    NS_LOG_INFO("Simulation complete!");
+    return 0;
+}
